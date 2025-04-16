@@ -16,6 +16,8 @@ pub fn build(b: *std.Build) void {
             .float64,
             .float16,
             .vector16,
+            .addresses,
+            .generic_pointer,
         }),
     });
 
@@ -30,8 +32,6 @@ pub fn build(b: *std.Build) void {
         .root_module = kernels_mod,
     });
 
-    b.installArtifact(kernels_lib);
-
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -43,8 +43,13 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("RawTerm", ansio.module("RawTerm"));
     exe_mod.linkSystemLibrary("OpenCL", .{});
 
+    const kernels_opt = b.addSystemCommand(&.{ "spirv-opt", "-O" });
+    kernels_opt.addFileArg(kernels_lib.getEmittedBin());
+    kernels_opt.addArg("-o");
+    const kernels_bin = kernels_opt.addOutputFileArg("kernels-opt.spv");
+
     exe_mod.addAnonymousImport("kernels.spv", .{
-        .root_source_file = kernels_lib.getEmittedBin(),
+        .root_source_file = kernels_bin,
     });
 
     const exe = b.addExecutable(.{
@@ -75,4 +80,3 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
 }
-

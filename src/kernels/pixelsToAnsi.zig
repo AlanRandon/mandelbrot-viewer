@@ -19,10 +19,11 @@ fn componentToBytes(component: u8) [3]u8 {
     };
 }
 
-fn colorToBytes(color: [3]u8) *const [3 * 3 + 2]u8 {
-    return componentToBytes(color[0]) ++ ";" ++
+fn colorToBytes(color: [3]u8) [3 * 3 + 2]u8 {
+    const result = componentToBytes(color[0]) ++ ";" ++
         componentToBytes(color[1]) ++ ";" ++
         componentToBytes(color[2]);
+    return result.*;
 }
 
 pub fn pixelsToAnsiKernel(
