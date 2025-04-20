@@ -4,6 +4,8 @@ const checkClError = @import("error.zig").checkClError;
 const RawTerm = @import("RawTerm");
 const pixelsToAnsi = @import("kernels/pixelsToAnsi.zig");
 const mandelbrot = @import("kernels/mandelbrot.zig");
+const ansi = RawTerm.ansi;
+const getClDevice = @import("device.zig").getClDevice;
 
 const State = struct {
     zoom: f32,
@@ -11,205 +13,243 @@ const State = struct {
     offset_y: f32,
 };
 
-pub fn render(
-    raw_term: *RawTerm,
-    stdout: std.fs.File,
+const Renderer = struct {
     context: c.cl_context,
     commands: c.cl_command_queue,
-    kernels: anytype,
-    out: *[]u8,
+    kernels: Kernels,
+    buffers: Buffers,
+    buf: []u8,
     allocator: std.mem.Allocator,
-    state: *const State,
-) !void {
-    const size = try raw_term.size();
-    const width: u32 = size.width;
-    const height: u32 = size.height - 1;
 
-    var err: c.cl_int = undefined;
-    const image_cl_buf = c.clCreateBuffer(
-        context,
-        c.CL_MEM_READ_WRITE,
-        width * 2 * height * 3,
-        null,
-        &err,
-    ) orelse {
-        try checkClError(err);
-        unreachable;
+    const bytes_per_pixel = 3;
+    const pixels_per_cell = 2; // upper and lower
+    const ansi_bytes_per_cell = pixelsToAnsi.unit_str.len;
+
+    const Kernels = struct {
+        mandelbrot: c.cl_kernel,
+        pixels_to_ansi: c.cl_kernel,
     };
 
-    {
-        const width_f: f32 = @floatFromInt(width);
-        const height_f: f32 = @floatFromInt(height);
-        const min_axis = @min(width_f, height_f * 2);
-        const center: @Vector(2, f32) = .{ state.offset_x, state.offset_y };
+    const Buffers = struct {
+        mandelbrot_args: c.cl_mem,
+        pixels_to_ansi_args: c.cl_mem,
+        image: c.cl_mem,
+        ansi_image: c.cl_mem,
 
-        const delta = 1.0 / state.zoom / min_axis;
+        fn resize(buffers: *Buffers, context: c.cl_context, width: u32, height: u32) !void {
+            var err: c.cl_int = undefined;
 
-        var args = mandelbrot.Args{
-            .upper_left_corner = center + @Vector(2, f32){ -delta, delta } * @Vector(2, f32){ width_f / 2, height_f },
-            .delta_x = delta,
-            .delta_y = -delta,
-            .width = width,
-        };
+            try checkClError(c.clReleaseMemObject(buffers.image));
+            buffers.image = c.clCreateBuffer(
+                context,
+                c.CL_MEM_READ_WRITE,
+                height * width * bytes_per_pixel * pixels_per_cell,
+                null,
+                &err,
+            ) orelse {
+                try checkClError(err);
+                unreachable;
+            };
 
-        const args_cl_buf = c.clCreateBuffer(
-            context,
-            c.CL_MEM_READ_ONLY | c.CL_MEM_USE_HOST_PTR,
-            @sizeOf(mandelbrot.Args),
-            @ptrCast(&args),
-            &err,
-        ) orelse {
+            try checkClError(c.clReleaseMemObject(buffers.ansi_image));
+            buffers.ansi_image = c.clCreateBuffer(
+                context,
+                c.CL_MEM_WRITE_ONLY | c.CL_MEM_HOST_READ_ONLY,
+                width * height * ansi_bytes_per_cell,
+                null,
+                &err,
+            ) orelse {
+                try checkClError(err);
+                unreachable;
+            };
+        }
+    };
+
+    fn init(
+        context: c.cl_context,
+        commands: c.cl_command_queue,
+        allocator: std.mem.Allocator,
+    ) !Renderer {
+        var err: c.cl_int = undefined;
+        const il = @embedFile("kernels.spv");
+        const program = c.clCreateProgramWithIL(context, il.ptr, il.len, &err) orelse {
             try checkClError(err);
             unreachable;
         };
 
-        try checkClError(c.clSetKernelArg(kernels.mandelbrot, 0, @sizeOf(c.cl_mem), @ptrCast(&image_cl_buf)));
-        try checkClError(c.clSetKernelArg(kernels.mandelbrot, 1, @sizeOf(c.cl_mem), @ptrCast(&args_cl_buf)));
+        try checkClError(c.clBuildProgram(program, 0, null, null, null, null));
 
-        var cl_dimensions: [2]usize = .{ width, height * 2 };
-        try checkClError(c.clEnqueueNDRangeKernel(commands, kernels.mandelbrot, 2, null, @constCast(&cl_dimensions), null, 0, null, null));
-        try checkClError(c.clFinish(commands));
-    }
-
-    {
-        var args = pixelsToAnsi.Args{
-            .width = width,
-            .height = height,
+        const kernels = Kernels{
+            .mandelbrot = c.clCreateKernel(program, "mandelbrotKernel", &err) orelse {
+                try checkClError(err);
+                unreachable;
+            },
+            .pixels_to_ansi = c.clCreateKernel(program, "pixelsToAnsiKernel", &err) orelse {
+                try checkClError(err);
+                unreachable;
+            },
         };
 
-        const args_cl_buf = c.clCreateBuffer(
-            context,
-            c.CL_MEM_READ_ONLY | c.CL_MEM_USE_HOST_PTR,
-            @sizeOf(pixelsToAnsi.Args),
-            @ptrCast(&args),
-            &err,
-        ) orelse {
-            try checkClError(err);
-            unreachable;
+        const initial_cells = 80 * 40;
+
+        const buffers = Buffers{
+            .mandelbrot_args = c.clCreateBuffer(
+                context,
+                c.CL_MEM_READ_ONLY | c.CL_MEM_HOST_WRITE_ONLY,
+                @sizeOf(mandelbrot.Args),
+                null,
+                &err,
+            ) orelse {
+                try checkClError(err);
+                unreachable;
+            },
+            .pixels_to_ansi_args = c.clCreateBuffer(
+                context,
+                c.CL_MEM_READ_ONLY | c.CL_MEM_HOST_WRITE_ONLY,
+                @sizeOf(pixelsToAnsi.Args),
+                null,
+                &err,
+            ) orelse {
+                try checkClError(err);
+                unreachable;
+            },
+            .image = c.clCreateBuffer(
+                context,
+                c.CL_MEM_READ_WRITE,
+                initial_cells * bytes_per_pixel * pixels_per_cell,
+                null,
+                &err,
+            ) orelse {
+                try checkClError(err);
+                unreachable;
+            },
+            .ansi_image = c.clCreateBuffer(
+                context,
+                c.CL_MEM_WRITE_ONLY | c.CL_MEM_HOST_READ_ONLY,
+                initial_cells * ansi_bytes_per_cell,
+                null,
+                &err,
+            ) orelse {
+                try checkClError(err);
+                unreachable;
+            },
         };
 
-        const out_len = @as(usize, width) * @as(usize, height) * pixelsToAnsi.unit_str.len;
-        if (out_len > out.len) {
-            out.* = try allocator.realloc(out.*, out_len);
-        }
+        const buf = try allocator.alloc(u8, initial_cells * ansi_bytes_per_cell);
+        errdefer allocator.free(buf);
 
-        const out_cl_buf = c.clCreateBuffer(
-            context,
-            c.CL_MEM_WRITE_ONLY | c.CL_MEM_HOST_READ_ONLY,
-            out_len,
-            null,
-            &err,
-        ) orelse {
-            try checkClError(err);
-            unreachable;
+        return .{
+            .context = context,
+            .commands = commands,
+            .kernels = kernels,
+            .buffers = buffers,
+            .buf = buf,
+            .allocator = allocator,
         };
-
-        try checkClError(c.clSetKernelArg(kernels.pixelsToAnsi, 0, @sizeOf(c.cl_mem), @ptrCast(&out_cl_buf)));
-        try checkClError(c.clSetKernelArg(kernels.pixelsToAnsi, 1, @sizeOf(c.cl_mem), @ptrCast(&image_cl_buf)));
-        try checkClError(c.clSetKernelArg(kernels.pixelsToAnsi, 2, @sizeOf(c.cl_mem), @ptrCast(&args_cl_buf)));
-
-        var cl_dimensions: [2]usize = .{ width, height };
-        try checkClError(c.clEnqueueNDRangeKernel(commands, kernels.pixelsToAnsi, 2, null, @constCast(&cl_dimensions), null, 0, null, null));
-        try checkClError(c.clFinish(commands));
-        try checkClError(c.clEnqueueReadBuffer(commands, out_cl_buf, c.CL_TRUE, 0, out_len, out.ptr, 0, null, null));
-        try checkClError(c.clFinish(commands));
-
-        try stdout.writer().print("\x1B[H{s}\x1B[0m", .{out.*[0..out_len]});
     }
 
-    try stdout.writer().print("\n\r\x1B[2KZoom: {} Offset: ({}, {})", .{ state.zoom, state.offset_x, state.offset_y });
-}
-
-fn deviceName(device: c.cl_device_id, allocator: std.mem.Allocator) ![]u8 {
-    var name_len: usize = undefined;
-    try checkClError(c.clGetDeviceInfo(device, c.CL_DEVICE_NAME, 0, null, &name_len));
-
-    const name = try allocator.alloc(u8, name_len);
-    errdefer allocator.free(name);
-
-    try checkClError(c.clGetDeviceInfo(device, c.CL_DEVICE_NAME, name_len, name.ptr, null));
-
-    return name;
-}
-
-fn deviceHasRequiredExtensions(device: c.cl_device_id, allocator: std.mem.Allocator) !bool {
-    var extensions_len: usize = undefined;
-    try checkClError(c.clGetDeviceInfo(device, c.CL_DEVICE_EXTENSIONS, 0, null, &extensions_len));
-
-    const extensions = try allocator.alloc(u8, extensions_len);
-    defer allocator.free(extensions);
-
-    try checkClError(c.clGetDeviceInfo(device, c.CL_DEVICE_EXTENSIONS, extensions_len, extensions.ptr, null));
-
-    return std.mem.indexOf(u8, extensions, "cl_khr_il_program") != null;
-}
-
-fn getClDeviceOnPlatform(allocator: std.mem.Allocator, platform_id: c.cl_platform_id, index: ?usize) !?c.cl_device_id {
-    var num_devices: c.cl_uint = undefined;
-    try checkClError(c.clGetDeviceIDs(platform_id, c.CL_DEVICE_TYPE_ALL, 0, null, &num_devices));
-
-    const device_ids = try allocator.alloc(c.cl_device_id, num_devices);
-    defer allocator.free(device_ids);
-
-    try checkClError(c.clGetDeviceIDs(platform_id, c.CL_DEVICE_TYPE_ALL, num_devices, device_ids.ptr, null));
-
-    if (index) |i| {
-        if (i >= device_ids.len) {
-            return error.ClDeviceIndexOutOfRange;
-        }
-
-        const id = device_ids[i];
-
-        if (!try deviceHasRequiredExtensions(id, allocator)) {
-            return error.ClDeviceMissingExtensions;
-        }
-
-        return id;
-    } else {
-        for (device_ids) |id| {
-            if (try deviceHasRequiredExtensions(id, allocator)) {
-                return id;
-            }
-        }
-
-        return null;
-    }
-}
-
-fn getClDevice(allocator: std.mem.Allocator) !c.cl_device_id {
-    var num_platforms: c.cl_uint = undefined;
-    try checkClError(c.clGetPlatformIDs(0, null, &num_platforms));
-
-    const platform_ids = try allocator.alloc(c.cl_platform_id, num_platforms);
-    defer allocator.free(platform_ids);
-
-    try checkClError(c.clGetPlatformIDs(num_platforms, platform_ids.ptr, null));
-
-    var env_map = try std.process.getEnvMap(allocator);
-    defer env_map.deinit();
-
-    const device_index = if (env_map.get("CL_DEVICE")) |index_str| try std.fmt.parseInt(usize, index_str, 10) else null;
-    const platform_index = if (env_map.get("CL_PLATFORM")) |index_str| try std.fmt.parseInt(usize, index_str, 10) else null;
-
-    if (platform_index) |i| {
-        if (i >= platform_ids.len) {
-            return error.ClPlatformIndexOutOfRange;
-        }
-
-        const platform_id = platform_ids[i];
-        if (try getClDeviceOnPlatform(allocator, platform_id, device_index)) |id| {
-            return id;
-        }
-    } else {
-        for (platform_ids) |platform_id| {
-            if (try getClDeviceOnPlatform(allocator, platform_id, device_index)) |id| {
-                return id;
-            }
-        }
+    pub fn deinit(renderer: *Renderer) void {
+        renderer.allocator.free(renderer.buf);
+        checkClError(c.clReleaseMemObject(renderer.buffers.mandelbrot_args)) catch unreachable;
+        checkClError(c.clReleaseMemObject(renderer.buffers.pixels_to_ansi_args)) catch unreachable;
+        checkClError(c.clReleaseMemObject(renderer.buffers.image)) catch unreachable;
+        checkClError(c.clReleaseMemObject(renderer.buffers.ansi_image)) catch unreachable;
     }
 
-    return error.MissingClDevice;
-}
+    pub fn render(renderer: *Renderer, size: RawTerm.Size, state: *const State) ![]u8 {
+        const width: u32 = size.width;
+        const height: u32 = size.height - 1;
+
+        const ansi_image_len = @as(usize, width) * @as(usize, height) * ansi_bytes_per_cell;
+        if (ansi_image_len > renderer.buf.len) {
+            renderer.buf = try renderer.allocator.realloc(renderer.buf, ansi_image_len);
+            try renderer.buffers.resize(renderer.context, width, height);
+        }
+
+        {
+            const width_f: f32 = @floatFromInt(width);
+            const height_f: f32 = @floatFromInt(height);
+            const min_axis = @min(width_f, height_f * 2);
+            const center: @Vector(2, f32) = .{ state.offset_x, state.offset_y };
+
+            const delta = 1.0 / state.zoom / min_axis;
+
+            var args = mandelbrot.Args{
+                .upper_left_corner = center + @Vector(2, f32){ -delta, delta } * @Vector(2, f32){ width_f / 2, height_f },
+                .delta_x = delta,
+                .delta_y = -delta,
+                .width = width,
+            };
+
+            try checkClError(c.clEnqueueWriteBuffer(
+                renderer.commands,
+                renderer.buffers.mandelbrot_args,
+                c.CL_TRUE,
+                0,
+                @sizeOf(mandelbrot.Args),
+                &args,
+                0,
+                null,
+                null,
+            ));
+        }
+
+        try checkClError(c.clSetKernelArg(renderer.kernels.mandelbrot, 0, @sizeOf(c.cl_mem), @ptrCast(&renderer.buffers.image)));
+        try checkClError(c.clSetKernelArg(renderer.kernels.mandelbrot, 1, @sizeOf(c.cl_mem), @ptrCast(&renderer.buffers.mandelbrot_args)));
+
+        {
+            var cl_dimensions: [2]usize = .{ width, height * 2 };
+            try checkClError(c.clEnqueueNDRangeKernel(renderer.commands, renderer.kernels.mandelbrot, 2, null, @constCast(&cl_dimensions), null, 0, null, null));
+            try checkClError(c.clFinish(renderer.commands));
+        }
+
+        {
+            var args = pixelsToAnsi.Args{
+                .width = width,
+                .height = height,
+            };
+
+            try checkClError(c.clEnqueueWriteBuffer(
+                renderer.commands,
+                renderer.buffers.pixels_to_ansi_args,
+                c.CL_TRUE,
+                0,
+                @sizeOf(pixelsToAnsi.Args),
+                &args,
+                0,
+                null,
+                null,
+            ));
+        }
+
+        try checkClError(c.clSetKernelArg(renderer.kernels.pixels_to_ansi, 0, @sizeOf(c.cl_mem), @ptrCast(&renderer.buffers.ansi_image)));
+        try checkClError(c.clSetKernelArg(renderer.kernels.pixels_to_ansi, 1, @sizeOf(c.cl_mem), @ptrCast(&renderer.buffers.image)));
+        try checkClError(c.clSetKernelArg(renderer.kernels.pixels_to_ansi, 2, @sizeOf(c.cl_mem), @ptrCast(&renderer.buffers.pixels_to_ansi_args)));
+
+        {
+            var cl_dimensions: [2]usize = .{ width, height };
+            try checkClError(c.clEnqueueNDRangeKernel(renderer.commands, renderer.kernels.pixels_to_ansi, 2, null, @constCast(&cl_dimensions), null, 0, null, null));
+            try checkClError(c.clFinish(renderer.commands));
+        }
+
+        try checkClError(c.clEnqueueReadBuffer(renderer.commands, renderer.buffers.ansi_image, c.CL_TRUE, 0, ansi_image_len, renderer.buf.ptr, 0, null, null));
+
+        return renderer.buf[0..ansi_image_len];
+    }
+
+    fn display(renderer: *Renderer, raw_term: *RawTerm, size: RawTerm.Size, state: *const State) !void {
+        const image = try renderer.render(size, state);
+        try raw_term.out.writer().print(
+            ansi.cursor.goto_top_left ++ "{s}" ++ ansi.style.reset ++ "\n\r" ++ ansi.clear.line ++ "Zoom: {} Offset: ({}, {})",
+            .{
+                image,
+                state.zoom,
+                state.offset_x,
+                state.offset_y,
+            },
+        );
+    }
+};
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
@@ -227,43 +267,23 @@ pub fn main() !void {
         unreachable;
     };
 
-    const il = @embedFile("kernels.spv");
-    const program = c.clCreateProgramWithIL(context, il.ptr, il.len, &err) orelse {
-        try checkClError(err);
-        unreachable;
-    };
-
-    try checkClError(c.clBuildProgram(program, 0, null, null, null, null));
-
-    const kernels = .{
-        .mandelbrot = c.clCreateKernel(program, "mandelbrotKernel", &err) orelse {
-            try checkClError(err);
-            unreachable;
-        },
-        .pixelsToAnsi = c.clCreateKernel(program, "pixelsToAnsiKernel", &err) orelse {
-            try checkClError(err);
-            unreachable;
-        },
-    };
-
-    const stdin = std.io.getStdIn();
-    const stdout = std.io.getStdOut();
-
-    var raw_term = try RawTerm.enable(stdin, false);
+    var raw_term = try RawTerm.enable(std.io.getStdIn(), std.io.getStdOut(), false);
     defer raw_term.disable() catch {};
 
     var listener = try raw_term.eventListener(allocator);
     defer listener.deinit();
 
-    try stdout.writeAll("\x1B[?1049h\x1B[?25l"); // enter alternate screen, hide cursor
-    defer stdout.writeAll("\x1B[?1049l\x1B[?25h") catch {}; // exit alternate screen, show cursor
-
-    var out = try allocator.alloc(u8, 80 * 40 * pixelsToAnsi.unit_str.len);
-    defer allocator.free(out);
+    try raw_term.out.writeAll(ansi.alternate_screen.enable ++ ansi.cursor.hide);
+    defer raw_term.out.writeAll(ansi.alternate_screen.disable ++ ansi.cursor.show) catch {};
 
     var state = State{ .zoom = 0.5, .offset_x = 0, .offset_y = 0 };
 
-    try render(&raw_term, stdout, context, commands, &kernels, &out, allocator, &state);
+    var size = try raw_term.size();
+
+    var renderer = try Renderer.init(context, commands, allocator);
+    defer renderer.deinit();
+
+    try renderer.display(&raw_term, size, &state);
 
     while (true) {
         const event = try listener.queue.wait();
@@ -272,36 +292,41 @@ pub fn main() !void {
                 'q' => break,
                 '+' => {
                     state.zoom *= 2.0;
-                    try render(&raw_term, stdout, context, commands, &kernels, &out, allocator, &state);
+                    try renderer.display(&raw_term, size, &state);
                 },
                 '-' => {
                     state.zoom /= 2.0;
-                    try render(&raw_term, stdout, context, commands, &kernels, &out, allocator, &state);
+                    try renderer.display(&raw_term, size, &state);
                 },
-                'r', '0' => {
+                '0' => {
+                    state.zoom = 1.0;
+                    try renderer.display(&raw_term, size, &state);
+                },
+                'r' => {
                     state = State{ .zoom = 1.0, .offset_x = 0, .offset_y = 0 };
-                    try render(&raw_term, stdout, context, commands, &kernels, &out, allocator, &state);
+                    try renderer.display(&raw_term, size, &state);
                 },
                 'h' => {
                     state.offset_x -= 0.5 / state.zoom;
-                    try render(&raw_term, stdout, context, commands, &kernels, &out, allocator, &state);
+                    try renderer.display(&raw_term, size, &state);
                 },
                 'j' => {
                     state.offset_y -= 0.5 / state.zoom;
-                    try render(&raw_term, stdout, context, commands, &kernels, &out, allocator, &state);
+                    try renderer.display(&raw_term, size, &state);
                 },
                 'k' => {
                     state.offset_y += 0.5 / state.zoom;
-                    try render(&raw_term, stdout, context, commands, &kernels, &out, allocator, &state);
+                    try renderer.display(&raw_term, size, &state);
                 },
                 'l' => {
                     state.offset_x += 0.5 / state.zoom;
-                    try render(&raw_term, stdout, context, commands, &kernels, &out, allocator, &state);
+                    try renderer.display(&raw_term, size, &state);
                 },
                 else => {},
             },
             .resize => {
-                try render(&raw_term, stdout, context, commands, &kernels, &out, allocator, &state);
+                size = try raw_term.size();
+                try renderer.display(&raw_term, size, &state);
             },
             else => {},
         }

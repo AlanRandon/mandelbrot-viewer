@@ -37,8 +37,8 @@
     // internet connectivity.
     .dependencies = .{
         .ansio = .{
-            .url = "git+https://github.com/AlanRandon/ansio#0099687375fa588bbac9367532491266e0183637",
-            .hash = "ansio-0.0.0-XC38dX5jAAD5-qFFoZDD2sfHdxme4n0-x4PKAKEJ4pwA",
+            .url = "git+https://github.com/AlanRandon/ansio#a5ad61866ce66471ef59dfe02d35518cf7763a1b",
+            .hash = "ansio-0.0.0-XC38dQ9oAACvs2H1FslIE9aYhshnNCjvmaK1BUj09SQy",
         },
     },
     .paths = .{

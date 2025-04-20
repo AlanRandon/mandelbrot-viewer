@@ -1,31 +1,34 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
-const Complex32 = struct {
-    real: f32,
-    imaginary: f32,
+const Float = f64;
+const max_iterations: usize = 1_000;
 
-    fn square(z: *const Complex32) Complex32 {
+const Complex = struct {
+    real: Float,
+    imaginary: Float,
+
+    fn square(z: *const Complex) Complex {
         return .{
             .real = z.real * z.real - z.imaginary * z.imaginary,
             .imaginary = z.real * z.imaginary * 2,
         };
     }
 
-    fn add(lhs: *const Complex32, rhs: *const Complex32) Complex32 {
+    fn add(lhs: *const Complex, rhs: *const Complex) Complex {
         return .{
             .real = rhs.real + lhs.real,
             .imaginary = rhs.imaginary + lhs.imaginary,
         };
     }
 
-    fn magnitude(z: *const Complex32) f32 {
+    fn magnitude(z: *const Complex) Float {
         // return std.math.hypot(z.real, z.imaginary);
         return std.math.sqrt(z.real * z.real + z.imaginary * z.imaginary);
     }
 };
 
-fn hsvToRgb(h: f32, s: f32, v: f32) @Vector(3, f32) {
+fn hsvToRgb(h: Float, s: Float, v: Float) @Vector(3, Float) {
     if (s == 0) {
         return .{ v, v, v };
     } else {
@@ -49,14 +52,14 @@ fn hsvToRgb(h: f32, s: f32, v: f32) @Vector(3, f32) {
 }
 
 pub const Args = extern struct {
-    upper_left_corner: [2]f32,
-    delta_x: f32,
-    delta_y: f32,
+    upper_left_corner: [2]Float,
+    delta_x: Float,
+    delta_y: Float,
     width: u32,
 };
 
 pub fn mandelbrotKernel(
-    out: [*]addrspace(.global) u8,
+    image: [*]addrspace(.global) u8,
     args_ptr: *addrspace(.global) const Args,
 ) callconv(.spirv_kernel) void {
     const args = args_ptr.*;
@@ -65,12 +68,11 @@ pub fn mandelbrotKernel(
     const index = (y * args.width + x) * 3;
 
     const bound = 2;
-    const max_iterations: usize = 10_000;
 
-    var z = Complex32{ .real = 0, .imaginary = 0 };
-    const c = Complex32{
-        .real = @mulAdd(f32, @floatFromInt(x), args.delta_x, args.upper_left_corner[0]),
-        .imaginary = @mulAdd(f32, @floatFromInt(y), args.delta_y, args.upper_left_corner[1]),
+    var z = Complex{ .real = 0, .imaginary = 0 };
+    const c = Complex{
+        .real = @mulAdd(Float, @floatFromInt(x), args.delta_x, args.upper_left_corner[0]),
+        .imaginary = @mulAdd(Float, @floatFromInt(y), args.delta_y, args.upper_left_corner[1]),
     };
 
     var iterations: usize = 1000;
@@ -84,21 +86,21 @@ pub fn mandelbrotKernel(
     }
 
     if (iterations >= max_iterations - 1) {
-        out[index] = 0;
-        out[index + 1] = 0;
-        out[index + 2] = 0;
+        image[index] = 0;
+        image[index + 1] = 0;
+        image[index + 2] = 0;
     } else {
         const h = @mod(@mulAdd(
-            f32,
-            @as(f32, @floatFromInt(iterations)) / @as(f32, @floatFromInt(max_iterations)),
+            Float,
+            @as(Float, @floatFromInt(iterations)) / @as(Float, @floatFromInt(max_iterations)),
             3,
             0.52,
         ), 1);
 
         const rgb = hsvToRgb(h, 0.7, 0.7);
-        const bytes: @Vector(3, u8) = @intFromFloat(@as(@Vector(3, f32), @splat(255)) * rgb);
-        out[index] = bytes[0];
-        out[index + 1] = bytes[1];
-        out[index + 2] = bytes[2];
+        const bytes: @Vector(3, u8) = @intFromFloat(@as(@Vector(3, Float), @splat(255)) * rgb);
+        image[index] = bytes[0];
+        image[index + 1] = bytes[1];
+        image[index + 2] = bytes[2];
     }
 }

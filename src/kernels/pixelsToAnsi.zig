@@ -27,7 +27,7 @@ fn colorToBytes(color: [3]u8) [3 * 3 + 2]u8 {
 }
 
 pub fn pixelsToAnsiKernel(
-    out: [*]addrspace(.global) u8,
+    ansi_image: [*]addrspace(.global) u8,
     image: [*]addrspace(.global) const u8,
     args_ptr: *addrspace(.global) const Args,
 ) callconv(.spirv_kernel) void {
@@ -47,5 +47,5 @@ pub fn pixelsToAnsiKernel(
         colorToBytes(bottom_color.*) ++
         "m▄";
 
-    @memcpy((out + (y * args.width + x) * unit_str.len)[0..unit_str.len], buf);
+    @memcpy((ansi_image + (y * args.width + x) * unit_str.len)[0..unit_str.len], buf);
 }
