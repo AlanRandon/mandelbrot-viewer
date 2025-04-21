@@ -11,8 +11,8 @@ pub fn build(b: *std.Build) void {
         .os_tag = .opencl,
         .cpu_features_add = std.Target.spirv.featureSet(&.{
             .int64,
-            .int16,
-            .int8,
+            // .int16,
+            // .int8,
             .float64,
             .float16,
             .vector16,

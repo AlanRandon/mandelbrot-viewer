@@ -18,8 +18,6 @@ const Renderer = struct {
     commands: c.cl_command_queue,
     kernels: Kernels,
     buffers: Buffers,
-    buf: []u8,
-    allocator: std.mem.Allocator,
 
     const bytes_per_pixel = 3;
     const pixels_per_cell = 2; // upper and lower
@@ -35,15 +33,19 @@ const Renderer = struct {
         pixels_to_ansi_args: c.cl_mem,
         image: c.cl_mem,
         ansi_image: c.cl_mem,
+        cell_count: usize,
 
         fn resize(buffers: *Buffers, context: c.cl_context, width: u32, height: u32) !void {
             var err: c.cl_int = undefined;
+
+            const cell_count = width * height;
+            buffers.cell_count = cell_count;
 
             try checkClError(c.clReleaseMemObject(buffers.image));
             buffers.image = c.clCreateBuffer(
                 context,
                 c.CL_MEM_READ_WRITE,
-                height * width * bytes_per_pixel * pixels_per_cell,
+                cell_count * pixels_per_cell * bytes_per_pixel,
                 null,
                 &err,
             ) orelse {
@@ -55,7 +57,7 @@ const Renderer = struct {
             buffers.ansi_image = c.clCreateBuffer(
                 context,
                 c.CL_MEM_WRITE_ONLY | c.CL_MEM_HOST_READ_ONLY,
-                width * height * ansi_bytes_per_cell,
+                cell_count * ansi_bytes_per_cell,
                 null,
                 &err,
             ) orelse {
@@ -68,7 +70,6 @@ const Renderer = struct {
     fn init(
         context: c.cl_context,
         commands: c.cl_command_queue,
-        allocator: std.mem.Allocator,
     ) !Renderer {
         var err: c.cl_int = undefined;
         const il = @embedFile("kernels.spv");
@@ -93,6 +94,7 @@ const Renderer = struct {
         const initial_cells = 80 * 40;
 
         const buffers = Buffers{
+            .cell_count = initial_cells,
             .mandelbrot_args = c.clCreateBuffer(
                 context,
                 c.CL_MEM_READ_ONLY | c.CL_MEM_HOST_WRITE_ONLY,
@@ -135,34 +137,28 @@ const Renderer = struct {
             },
         };
 
-        const buf = try allocator.alloc(u8, initial_cells * ansi_bytes_per_cell);
-        errdefer allocator.free(buf);
-
         return .{
             .context = context,
             .commands = commands,
             .kernels = kernels,
             .buffers = buffers,
-            .buf = buf,
-            .allocator = allocator,
         };
     }
 
     pub fn deinit(renderer: *Renderer) void {
-        renderer.allocator.free(renderer.buf);
         checkClError(c.clReleaseMemObject(renderer.buffers.mandelbrot_args)) catch unreachable;
         checkClError(c.clReleaseMemObject(renderer.buffers.pixels_to_ansi_args)) catch unreachable;
         checkClError(c.clReleaseMemObject(renderer.buffers.image)) catch unreachable;
         checkClError(c.clReleaseMemObject(renderer.buffers.ansi_image)) catch unreachable;
     }
 
-    pub fn render(renderer: *Renderer, size: RawTerm.Size, state: *const State) ![]u8 {
+    pub fn render(renderer: *Renderer, size: RawTerm.Size, state: *const State) ![]const u8 {
         const width: u32 = size.width;
         const height: u32 = size.height - 1;
 
-        const ansi_image_len = @as(usize, width) * @as(usize, height) * ansi_bytes_per_cell;
-        if (ansi_image_len > renderer.buf.len) {
-            renderer.buf = try renderer.allocator.realloc(renderer.buf, ansi_image_len);
+        const cell_count = @as(usize, width) * @as(usize, height);
+        const ansi_image_len = cell_count * ansi_bytes_per_cell;
+        if (cell_count > renderer.buffers.cell_count) {
             try renderer.buffers.resize(renderer.context, width, height);
         }
 
@@ -232,13 +228,37 @@ const Renderer = struct {
             try checkClError(c.clFinish(renderer.commands));
         }
 
-        try checkClError(c.clEnqueueReadBuffer(renderer.commands, renderer.buffers.ansi_image, c.CL_TRUE, 0, ansi_image_len, renderer.buf.ptr, 0, null, null));
+        var err: c.cl_int = undefined;
+        const ptr: [*]const u8 = @ptrCast(c.clEnqueueMapBuffer(
+            renderer.commands,
+            renderer.buffers.ansi_image,
+            c.CL_TRUE,
+            c.CL_MAP_READ,
+            0,
+            ansi_image_len,
+            0,
+            null,
+            null,
+            &err,
+        ) orelse {
+            try checkClError(err);
+            unreachable;
+        });
+        const buf = ptr[0..ansi_image_len];
+        errdefer renderer.unmapBuffer(buf);
 
-        return renderer.buf[0..ansi_image_len];
+        return buf;
+    }
+
+    fn unmapBuffer(renderer: *Renderer, buf: []const u8) void {
+        const ptr = @constCast(buf.ptr);
+        checkClError(c.clEnqueueUnmapMemObject(renderer.commands, renderer.buffers.ansi_image, ptr, 0, null, null)) catch unreachable;
     }
 
     fn display(renderer: *Renderer, raw_term: *RawTerm, size: RawTerm.Size, state: *const State) !void {
         const image = try renderer.render(size, state);
+        defer renderer.unmapBuffer(image);
+
         try raw_term.out.writer().print(
             ansi.cursor.goto_top_left ++ "{s}" ++ ansi.style.reset ++ "\n\r" ++ ansi.clear.line ++ "Zoom: {} Offset: ({}, {})",
             .{
@@ -280,7 +300,7 @@ pub fn main() !void {
 
     var size = try raw_term.size();
 
-    var renderer = try Renderer.init(context, commands, allocator);
+    var renderer = try Renderer.init(context, commands);
     defer renderer.deinit();
 
     try renderer.display(&raw_term, size, &state);
